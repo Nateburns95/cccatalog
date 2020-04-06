@@ -1,4 +1,8 @@
 import logging
+import os
+
+import boto3
+from moto import mock_s3
 import pytest
 
 from common.storage import image
@@ -123,6 +127,26 @@ def test_ImageStore_add_item_flushes_buffer(
 def test_ImageStore_commit_writes_nothing_if_no_lines_in_buffer():
     image_store = image.ImageStore(output_dir='/path/does/not/exist')
     image_store.commit()
+
+
+@mock_s3
+def test_ImageStore_commit_copies_to_s3(monkeypatch, tmpdir):
+    test_path = tmpdir.join('testing.tsv')
+    test_body = 'my\ttsv\tstring\n'
+    test_path.write(test_body)
+    s3_bucket = os.getenv('CCCATALOG_STORAGE_BUCKET')
+    s3 = boto3.resource('s3', region_name='us-east-1')
+    s3.create_bucket(Bucket=s3_bucket)
+    expect_bucket = s3.Bucket(s3_bucket)
+    image_store = image.ImageStore(provider='testprovider')
+    image_store._OUTPUT_PATH = str(test_path)
+    image_store.commit()
+    bucket_list = [object_ for object_ in expect_bucket.objects.all()]
+
+    assert len(bucket_list) == 1
+
+    actual_body = bucket_list[0].get()['Body'].read().decode('utf-8')
+    assert actual_body == test_body
 
 
 def test_ImageStore_get_image_places_given_args(

@@ -2,6 +2,9 @@ from collections import namedtuple
 from datetime import datetime
 import logging
 import os
+import uuid
+
+import boto3
 
 from common.storage import util
 from common.storage import columns
@@ -77,12 +80,22 @@ class ImageStore:
     A class that stores image information from a given provider.
 
     Optional init arguments:
-    provider:       String marking the provider in the `image` table of the DB.
-    output_file:    String giving a temporary .tsv filename (*not* the
-                    full path) where the image info should be stored.
-    output_dir:     String giving a path where `output_file` should be placed.
-    buffer_length:  Integer giving the maximum number of image information rows
-                    to store in memory before writing them to disk.
+    provider:        String marking the provider in the `image` table of
+                     the DB.
+    output_file:     String giving a temporary .tsv filename (*not* the
+                     full path) where the image info should be stored.
+    output_dir:      String giving a path where `output_file` should be
+                     placed.
+    buffer_length:   Integer giving the maximum number of image meta-
+                     data rows to store in memory before writing them to
+                     disk.
+    aws_s3_bucket:   String giving the name of an S3 bucket to copy the
+                     output TSV to.  If set, this requires proper AWS
+                     authentication.
+    aws_access_key:  String giving AWS access key to use when copying
+                     the output TSV to an S3 bucket.
+    aws_secret_key:  String giving AWS secret key to use when copying
+                     the output TSV to an S3 bucket.
     """
 
     def __init__(
@@ -90,7 +103,10 @@ class ImageStore:
             provider=None,
             output_file=None,
             output_dir=None,
-            buffer_length=100
+            buffer_length=100,
+            aws_s3_bucket=None,
+            aws_access_key=None,
+            aws_secret_key=None,
     ):
         logger.info('Initialized with provider {}'.format(provider))
         self._image_buffer = []
@@ -102,6 +118,11 @@ class ImageStore:
             output_dir,
             output_file,
             provider,
+        )
+        self._S3_OBJECT = self._initialize_s3_object(
+            aws_s3_bucket,
+            aws_access_key,
+            aws_secret_key,
         )
 
     def add_item(
@@ -202,8 +223,12 @@ class ImageStore:
         return self._total_images
 
     def commit(self):
-        """Writes all remaining images in the buffer to disk."""
+        """
+        Writes all remaining images in the buffer to disk,
+        then copies the output file to S3.
+        """
         self._flush_buffer()
+        self._upload_output_to_s3()
 
         return self._total_images
 
@@ -231,6 +256,52 @@ class ImageStore:
         output_path = os.path.join(output_dir, output_file)
         logger.info('Output path: {}'.format(output_path))
         return output_path
+
+    def _initialize_s3_object(self, s3_bucket, access_key, secret_key):
+        if s3_bucket is None:
+            logger.debug(
+                'No given s3_bucket.  '
+                'Using CCCATALOG_STORAGE_BUCKET from environment.'
+            )
+            s3_bucket = os.getenv('CCCATALOG_STORAGE_BUCKET')
+        if access_key is None:
+            logger.debug(
+                'No AWS credentials given.'
+                'Using AWS_ACCESS_KEY and AWS_SECRET_KEY from environment.'
+            )
+            access_key = os.getenv('AWS_ACCESS_KEY')
+            secret_key = os.getenv('AWS_SECRET_KEY')
+
+        requirements_met = util.check_all_arguments_exist(
+            s3_bucket=s3_bucket,
+            access_key=access_key,
+            secret_key=secret_key,
+        )
+        if requirements_met:
+            obj_name = str(uuid.uuid4()) + '.tsv'
+            date_str = datetime.strftime(self._NOW, '%Y-%m-%d')
+            provider = str(self._PROVIDER)
+            output_key_pieces = ['image', provider, date_str, obj_name]
+            output_key = '/'.join(output_key_pieces)
+            s3_object = (
+                boto3
+                .resource(
+                    's3',
+                    aws_access_key_id=access_key,
+                    aws_secret_access_key=secret_key
+                )
+                .Object(s3_bucket, output_key)
+            )
+        else:
+            logger.warning(
+                'Some AWS requirement is unmet.  '
+                'No output will be copied to AWS S3!'
+            )
+            s3_object = None
+
+        logger.info(f's3_object.bucket_name:  {s3_object.bucket_name}')
+        logger.info(f's3_object.key:  {s3_object.key}')
+        return s3_object
 
     def _get_image(
             self,
@@ -319,6 +390,18 @@ class ImageStore:
         else:
             logger.debug('Empty buffer!  Nothing to write.')
         return buffer_length
+
+    def _upload_output_to_s3(self):
+        if self._S3_OBJECT is None:
+            logger.info('No s3 object available.  No output uploaded')
+        elif not os.path.exists(self._OUTPUT_PATH):
+            logger.info('No output file.  No output uploaded')
+        else:
+            logger.info(f'Uploading {self._OUTPUT_PATH} to {self._S3_OBJECT}')
+            response = self._S3_OBJECT.upload_file(self._OUTPUT_PATH)
+            print(type(response))
+            print(response)
+            return response
 
     def _enrich_meta_data(self, meta_data, license_url):
         if type(meta_data) != dict:
